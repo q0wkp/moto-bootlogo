@@ -4,18 +4,74 @@ import os
 import io
 import json
 import hashlib
+import tempfile
+import shutil
 from PIL import Image
 
+COLORS = {
+    'black': (0, 0, 0),
+    'white': (255, 255, 255),
+    'red': (255, 0, 0),
+    'green': (0, 255, 0),
+    'blue': (0, 0, 255),
+    'yellow': (255, 255, 0),
+    'cyan': (0, 255, 255),
+    'magenta': (255, 0, 255),
+    'orange': (255, 165, 0),
+    'gray': (128, 128, 128),
+}
+
+def parse_size(size_str):
+    """Parse size string: 32MB, 32MiB, or raw bytes (33554432)"""
+    if size_str is None:
+        return None
+    s = str(size_str).strip().upper()
+    if s.endswith('MIB'):
+        return int(s[:-3]) * 1024 * 1024
+    elif s.endswith('MB'):
+        return int(s[:-2]) * 1024 * 1024
+    return int(s)
+
 class MotoBootLogo:
-    def __init__(self, input, output, list):
+    def __init__(self, input, output, list, dedup=True, pad_size=None, replace=None):
         if list:
             if os.path.isfile(list):
                 self.decode(list, None); return
-        elif os.path.isfile(input):
-            self.decode(input, output); return
+        elif os.path.isfile(input) and output:
+            # Check if output looks like a file (has extension or doesn't exist as directory)
+            out_is_file = output.endswith('.bin') or output.endswith('.img') or \
+                          (not os.path.isdir(output) and '.' in os.path.basename(output))
+            
+            if out_is_file:
+                # File-to-file mode: requires --replace or --pad
+                if not replace and not pad_size:
+                    print("[-] File-to-file mode requires --replace or --pad")
+                    print("[-] Otherwise use: -i file.bin -o output_dir (to decode)")
+                    return
+                self.transform(input, output, dedup=dedup, pad_size=pad_size, replace=replace)
+                return
+            else:
+                # Decode to directory
+                self.decode(input, output); return
         elif os.path.isdir(input):
-            self.encode(input, output); return
+            self.encode(input, output, dedup=dedup, pad_size=pad_size, replace=replace); return
         print("[-] Input FILE/DIR inaccessible")
+    
+    def transform(self, infile, outfile, dedup=True, pad_size=None, replace=None):
+        """File-to-file transformation: decode -> modify -> encode"""
+        print("[+] Transform [%s] => [%s]" % (infile, outfile))
+        
+        # Create temp directory
+        tmpdir = tempfile.mkdtemp(prefix="motologo_")
+        try:
+            # Decode to temp
+            self.decode(infile, tmpdir)
+            
+            # Encode back with modifications
+            self.encode(tmpdir, outfile, dedup=dedup, pad_size=pad_size, replace=replace)
+        finally:
+            # Cleanup temp directory
+            shutil.rmtree(tmpdir, ignore_errors=True)
 
     def intFromByte(self, bytes=1):
         return int.from_bytes(self.infile.read(bytes), byteorder="little", signed=True)
@@ -134,7 +190,7 @@ class MotoBootLogo:
         with open(dirname + "/data.json", 'w') as dfile:
             json.dump(data, dfile, indent=2)
 
-    def encode(self, dirname, filename):
+    def encode(self, dirname, filename, dedup=True, pad_size=None, replace=None):
         print("[+] Input [%s] => Output [%s]" % (dirname, filename))
         
         try:
@@ -144,10 +200,60 @@ class MotoBootLogo:
             print("[-] " + dirname + "/data.json inaccessible")
             return
 
-        print("[+] %s Images found" % (data['count']))
-        if data['count'] != len(data['name']):
-            print("[-] Image list not equal to image count")
+        # Parse replace dict: {filename: color_rgb}
+        replace_dict = {}
+        if replace:
+            for item in replace:
+                if '=' not in item:
+                    print("[-] Invalid replace format: %s (use color=filename)" % item)
+                    continue
+                color, name = item.split('=', 1)
+                
+                # Parse color: named color or hex code (#RRGGBB or RRGGBB)
+                if color in COLORS:
+                    rgb = COLORS[color]
+                elif color.startswith('#') and len(color) == 7:
+                    try:
+                        rgb = (int(color[1:3], 16), int(color[3:5], 16), int(color[5:7], 16))
+                    except ValueError:
+                        print("[-] Invalid hex color: %s" % color)
+                        continue
+                elif len(color) == 6:
+                    try:
+                        rgb = (int(color[0:2], 16), int(color[2:4], 16), int(color[4:6], 16))
+                    except ValueError:
+                        print("[-] Invalid hex color: %s" % color)
+                        continue
+                else:
+                    print("[-] Unknown color: %s (use name or #RRGGBB)" % color)
+                    continue
+                
+                replace_dict[name] = rgb
+                print("[+] Will replace %s with %s" % (name, rgb))
+
+        # Auto-detect missing files and update metadata
+        original_names = data['name'][:]
+        valid_names = []
+        missing_names = []
+        
+        for name in original_names:
+            if name in replace_dict or os.path.isfile("%s/%s.png" % (dirname, name)):
+                valid_names.append(name)
+            else:
+                missing_names.append(name)
+        
+        if missing_names:
+            print("[+] Missing files (removed): %s" % (", ".join(missing_names)))
+            data['name'] = valid_names
+            data['count'] = len(valid_names)
+        
+        print("[+] %s Images to encode" % (data['count']))
+        
+        if data['count'] == 0:
+            print("[-] No images to encode")
             return
+        
+        self.replace_dict = replace_dict
 
         stream = io.BytesIO()
 
@@ -187,32 +293,47 @@ class MotoBootLogo:
             while ((stream.tell() % 0x200) != 0):
                 stream.write(self.uintToByte(0xFF))
 
-            print("[+] Processing %s" % (data['name'][i]))
+            name = data['name'][i]
             try:
-                img = Image.open("%s/%s.png" % (dirname, data['name'][i]))
+                if name in self.replace_dict:
+                    color = self.replace_dict[name]
+                    orig_img = Image.open("%s/%s.png" % (dirname, name))
+                    img = Image.new("RGB", orig_img.size, color)
+                    print("[+] Processing %s (solid color %s)" % (name, color))
+                else:
+                    img = Image.open("%s/%s.png" % (dirname, name))
+                    print("[+] Processing %s" % (name))
                 result = self.encodeImg(img)
-            except Exception:
-                print("[-] Image corrupt or inaccessible")
+            except Exception as e:
+                print("[-] Image corrupt or inaccessible: %s" % e)
                 return
 
             tempoffset = stream.tell()
             tempsize = len(result)
-            hash = hashlib.md5(result).hexdigest()
 
-            if hash in hashes:
-                index = hashes.index(hash)
-                tempoffset = offset[index]
-                tempsize = size[index]
+            if dedup:
+                hash = hashlib.md5(result).hexdigest()
+                if hash in hashes:
+                    index = hashes.index(hash)
+                    tempoffset = offset[index]
+                    tempsize = size[index]
+                else:
+                    hashes.append(hash)
+                    offset.append(tempoffset)
+                    size.append(tempsize)
+                    stream.write(result)
             else:
-                hashes.append(hash)
-                offset.append(tempoffset)
-                size.append(tempsize)
                 stream.write(result)
 
             stream.seek(0x0D + 0x18 + (i * 0x20))
             stream.write(self.intToByte(tempoffset, 4))
             stream.write(self.intToByte(tempsize, 4))
             stream.seek(0, io.SEEK_END)
+
+        if pad_size and stream.tell() < pad_size:
+            padding = pad_size - stream.tell()
+            print("[+] Padding with %d bytes (0x00) to %d bytes" % (padding, pad_size))
+            stream.write(b'\x00' * padding)
 
         with open(filename, "wb") as outfile:
             outfile.write(stream.getvalue())
@@ -285,6 +406,13 @@ if __name__ == "__main__":
     parser.add_argument('-i', required=not list, dest='INPUT', help='FILE/DIR')
     parser.add_argument('-o', required=not list, dest='OUTPUT', help='DIR/FILE')
     parser.add_argument('-l', required=list, dest='FILE', help='List images, no decoding')
+    parser.add_argument('--no-dedup', action='store_true', help='Disable image deduplication')
+    parser.add_argument('--pad', dest='PAD_SIZE', help='Pad output to size (32MB, 32MiB, or bytes)')
+    parser.add_argument('--replace', nargs='+', dest='REPLACE', metavar='COLOR=NAME',
+                        help='Replace image with solid color (e.g., --replace black=logo_boot)')
     args = parser.parse_args()
 
-    mbl = MotoBootLogo(args.INPUT, args.OUTPUT, args.FILE)
+    pad_size = parse_size(args.PAD_SIZE)
+    mbl = MotoBootLogo(args.INPUT, args.OUTPUT, args.FILE, 
+                       dedup=not args.no_dedup, pad_size=pad_size,
+                       replace=args.REPLACE)
